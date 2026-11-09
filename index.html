@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Практическая работа 12 — вариант 26</title>
+<style>
+:root{font-family:Arial,sans-serif;color:#1f2937;background:#f3f5f8}
+body{margin:20px}h1{font-size:25px}.panel{background:#fff;border:1px solid #d8dee8;border-radius:12px;padding:16px;margin:14px 0}
+.controls{display:flex;flex-wrap:wrap;gap:12px;align-items:end}
+label{display:flex;flex-direction:column;gap:5px;font-weight:600;font-size:14px}
+input{width:120px;padding:8px;border:1px solid #b8c2cc;border-radius:6px;font-size:15px}
+button{padding:10px 15px;border:1px solid #0b63ce;border-radius:7px;background:#0b63ce;color:white;cursor:pointer}
+button.secondary{background:#fff;color:#1f2937;border-color:#b8c2cc}
+button:disabled{opacity:.55;cursor:wait}
+.note{color:#56616e;line-height:1.5;font-size:14px}
+.status{padding:10px;background:#eef6ff;border-radius:7px;margin-top:12px}
+.previews{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+canvas{width:100%;height:auto;background:#080b12;border:1px solid #ccd3dd;border-radius:7px}
+.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.metric{background:#f8fafc;border:1px solid #dce2e9;padding:12px;border-radius:8px}
+.metric strong{display:block;font-size:13px;color:#596575;margin-bottom:6px}
+.metric span{font-size:20px;font-weight:700}
+#log{white-space:pre-wrap;background:#111827;color:#d1e7ff;padding:12px;border-radius:8px;min-height:80px;font:13px Consolas,monospace}
+@media(max-width:850px){.previews{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<h1>Практическая работа №12 — работа с графическим процессором</h1>
+<div class="panel">
+  <h2>Вариант 26 — множество Мандельброта</h2>
+  <div class="controls">
+    <label>Ширина<input id="width" type="number" min="16" max="4096" value="1920"></label>
+    <label>Высота<input id="height" type="number" min="16" max="4096" value="1080"></label>
+    <label>Zoom<input id="zoom" type="number" step="0.01" value="2.40"></label>
+    <label>Offset X<input id="offsetX" type="number" step="0.01" value="-0.10"></label>
+    <label>Offset Y<input id="offsetY" type="number" step="0.01" value="0.65"></label>
+    <label>Max Iterations<input id="maxIter" type="number" min="1" max="2000" value="320"></label>
+    <label>Color Power<input id="colorPower" type="number" step="0.01" min="0.01" value="0.50"></label>
+  </div>
+  <div class="controls" style="margin-top:14px">
+    <button id="cpuBtn">Запустить CPU</button>
+    <button id="gpuBtn">Запустить GPU</button>
+    <button id="bothBtn">Запустить CPU + GPU</button>
+    <button id="resetBtn" class="secondary">Сбросить параметры варианта</button>
+  </div>
+  <div id="support" class="status">Проверка WebGPU…</div>
+  <p class="note">CPU выполняет расчёт на JavaScript, GPU — compute shader на WGSL. Для честного сравнения используется одна формула и одинаковые параметры. Время GPU включает отправку вычислений и чтение результата обратно в память CPU; первоначальная компиляция шейдера в замер не входит.</p>
+</div>
+<div class="panel previews">
+  <div><h2>CPU (JavaScript)</h2><canvas id="cpuCanvas" width="960" height="540"></canvas><p id="cpuInfo" class="note">Результат ещё не рассчитан.</p></div>
+  <div><h2>GPU (WebGPU / WGSL)</h2><canvas id="gpuCanvas" width="960" height="540"></canvas><p id="gpuInfo" class="note">Результат ещё не рассчитан.</p></div>
+</div>
+<div class="panel metrics">
+  <div class="metric"><strong>CPU time</strong><span id="cpuTime">—</span></div>
+  <div class="metric"><strong>GPU time</strong><span id="gpuTime">—</span></div>
+  <div class="metric"><strong>Acceleration</strong><span id="speedup">—</span></div>
+  <div class="metric"><strong>Mean diff (0–255)</strong><span id="meanDiff">—</span></div>
+  <div class="metric"><strong>Max diff (0–255)</strong><span id="maxDiff">—</span></div>
+  <div class="metric"><strong>Resolution</strong><span id="size">1920 × 1080</span></div>
+</div>
+<div class="panel"><h2>Лог выполнения</h2><div id="log">Страница загружена.\n</div></div>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const cpuCanvas = $("cpuCanvas"), gpuCanvas = $("gpuCanvas");
+const cpuCtx = cpuCanvas.getContext("2d"), gpuCtx = gpuCanvas.getContext("2d");
+let device = null, adapter = null, cpuPixels = null, gpuPixels = null;
+const WORKGROUP = 16;
+
+function log(message) {
+  $("log").textContent += `[${new Date().toLocaleTimeString()}] ${message}\n`;
+  $("log").scrollTop = $("log").scrollHeight;
+}
+function params() {
+  const p = {
+    width: Math.floor(Number($("width").value)),
+    height: Math.floor(Number($("height").value)),
+    zoom: Number($("zoom").value),
+    offsetX: Number($("offsetX").value),
+    offsetY: Number($("offsetY").value),
+    maxIter: Math.floor(Number($("maxIter").value)),
+    colorPower: Number($("colorPower").value)
+  };
+  if (!Number.isInteger(p.width) || !Number.isInteger(p.height) ||
+      p.width < 16 || p.height < 16 || p.width > 4096 || p.height > 4096)
+    throw new Error("Разрешение должно быть от 16 до 4096 пикселей по каждой стороне.");
+  if (!(p.zoom > 0) || !Number.isFinite(p.zoom) ||
+      !Number.isFinite(p.offsetX) || !Number.isFinite(p.offsetY) ||
+      !Number.isInteger(p.maxIter) || p.maxIter < 1 || p.maxIter > 2000 ||
+      !(p.colorPower > 0) || !Number.isFinite(p.colorPower))
+    throw new Error("Проверьте параметры Zoom, Offset, Max Iterations и Color Power.");
+  return p;
+}
+function setBusy(busy) {
+  for (const id of ["cpuBtn","gpuBtn","bothBtn","resetBtn"]) $(id).disabled = busy;
+}
+function resetMetrics() {
+  for (const id of ["cpuTime","gpuTime","speedup","meanDiff","maxDiff"]) $(id).textContent = "—";
+  cpuPixels = null; gpuPixels = null;
+}
+function coords(x,y,p) {
+  const aspect = p.width / p.height;
+  const scale = 3.5 / p.zoom;
+  const re = ((x / (p.width - 1)) - 0.5) * scale * aspect + p.offsetX;
+  const im = ((y / (p.height - 1)) - 0.5) * scale + p.offsetY;
+  return [re, im];
+}
+function colorFor(iter, p) {
+  if (iter >= p.maxIter) return [0,0,0,255];
+  const t = Math.pow(iter / p.maxIter, p.colorPower);
+  const tau = 6.283185307179586;
+  const r = 0.5 + 0.5 * Math.cos(tau * t);
+  const g = 0.5 + 0.5 * Math.cos(tau * (t + 0.33));
+  const b = 0.5 + 0.5 * Math.cos(tau * (t + 0.67));
+  return [Math.round(r*255),Math.round(g*255),Math.round(b*255),255];
+}
+function mandelbrotCPU(p) {
+  const out = new Uint8ClampedArray(p.width*p.height*4);
+  let k = 0;
+  for (let y=0; y<p.height; y++) {
+    for (let x=0; x<p.width; x++) {
+      const [cr,ci] = coords(x,y,p);
+      let zr=0, zi=0, iter=0;
+      while (zr*zr + zi*zi <= 4 && iter < p.maxIter) {
+        const zrNext = zr*zr - zi*zi + cr;
+        zi = 2*zr*zi + ci;
+        zr = zrNext;
+        iter++;
+      }
+      const c = colorFor(iter,p);
+      out[k++]=c[0]; out[k++]=c[1]; out[k++]=c[2]; out[k++]=c[3];
+    }
+  }
+  return out;
+}
+function drawPreview(ctx,pixels,p) {
+  const image = new ImageData(new Uint8ClampedArray(pixels),p.width,p.height);
+  const temp = document.createElement("canvas");
+  temp.width=p.width; temp.height=p.height;
+  temp.getContext("2d").putImageData(image,0,0);
+  ctx.clearRect(0,0,ctx.canvas.width,ctx.canvas.height);
+  ctx.drawImage(temp,0,0,ctx.canvas.width,ctx.canvas.height);
+}
+async function initGPU() {
+  if (device) return device;
+  if (!navigator.gpu) throw new Error("navigator.gpu недоступен. Откройте страницу через localhost в актуальном Chrome или Edge.");
+  adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) throw new Error("Браузер не смог получить GPU-адаптер.");
+  device = await adapter.requestDevice();
+  device.lost.then(info => {
+    log("GPU device lost: " + (info.message || "неизвестная причина"));
+    device = null;
+  });
+  return device;
+}
+function shaderSource() {
+return `
+struct Params {
+  width: u32,
+  height: u32,
+  maxIter: u32,
+  zoom: f32,
+  offsetX: f32,
+  offsetY: f32,
+  colorPower: f32,
+  _pad: f32,
+};
+@group(0) @binding(0) var<storage, read_write> outputPixels: array<u32>;
+@group(0) @binding(1) var<uniform> p: Params;
+
+fn packColor(iter: u32) -> u32 {
+  var c: vec3<f32>;
+  if (iter >= p.maxIter) {
+    c = vec3<f32>(0.0, 0.0, 0.0);
+  } else {
+    let t = pow(f32(iter) / f32(p.maxIter), p.colorPower);
+    let tau = 6.283185307179586;
+    c = vec3<f32>(
+      0.5 + 0.5 * cos(tau * t),
+      0.5 + 0.5 * cos(tau * (t + 0.33)),
+      0.5 + 0.5 * cos(tau * (t + 0.67))
+    );
+  }
+  let rgb = vec3<u32>(round(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)) * 255.0));
+  return rgb.x | (rgb.y << 8u) | (rgb.z << 16u) | (255u << 24u);
+}
+@compute @workgroup_size(16,16,1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let x = gid.x;
+  let y = gid.y;
+  if (x >= p.width || y >= p.height) { return; }
+  let aspect = f32(p.width) / f32(p.height);
+  let scale = 3.5 / p.zoom;
+  let cr = ((f32(x) / f32(p.width - 1u)) - 0.5) * scale * aspect + p.offsetX;
+  let ci = ((f32(y) / f32(p.height - 1u)) - 0.5) * scale + p.offsetY;
+  var zr = 0.0;
+  var zi = 0.0;
+  var iter = 0u;
+  loop {
+    if (zr*zr + zi*zi > 4.0 || iter >= p.maxIter) { break; }
+    let zrNext = zr*zr - zi*zi + cr;
+    zi = 2.0*zr*zi + ci;
+    zr = zrNext;
+    iter = iter + 1u;
+  }
+  let idx = y * p.width + x;
+  outputPixels[idx] = packColor(iter);
+}`;
+}
+async function mandelbrotGPU(p) {
+  const d = await initGPU();
+  const byteSize = p.width*p.height*4;
+  const outputBuffer = d.createBuffer({size:byteSize,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC});
+  const readBuffer = d.createBuffer({size:byteSize,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+  const uniformBuffer = d.createBuffer({size:32,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});
+  const module = d.createShaderModule({code:shaderSource()});
+  const info = await module.getCompilationInfo();
+  const errors = info.messages.filter(m=>m.type==="error");
+  if (errors.length) {
+    outputBuffer.destroy(); readBuffer.destroy(); uniformBuffer.destroy();
+    throw new Error("Ошибка WGSL: " + errors.map(e=>`строка ${e.lineNum}: ${e.message}`).join(" | "));
+  }
+  const pipeline = d.createComputePipeline({layout:"auto",compute:{module,entryPoint:"main"}});
+  const u = new ArrayBuffer(32), v = new DataView(u);
+  v.setUint32(0,p.width,true); v.setUint32(4,p.height,true); v.setUint32(8,p.maxIter,true);
+  v.setFloat32(12,p.zoom,true); v.setFloat32(16,p.offsetX,true);
+  v.setFloat32(20,p.offsetY,true); v.setFloat32(24,p.colorPower,true); v.setFloat32(28,0,true);
+  d.queue.writeBuffer(uniformBuffer,0,u);
+  const bindGroup = d.createBindGroup({layout:pipeline.getBindGroupLayout(0),entries:[
+    {binding:0,resource:{buffer:outputBuffer}},
+    {binding:1,resource:{buffer:uniformBuffer}}
+  ]});
+  const encoder = d.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline); pass.setBindGroup(0,bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(p.width/WORKGROUP),Math.ceil(p.height/WORKGROUP));
+  pass.end();
+  encoder.copyBufferToBuffer(outputBuffer,0,readBuffer,0,byteSize);
+  const start = performance.now();
+  d.queue.submit([encoder.finish()]);
+  await d.queue.onSubmittedWorkDone();
+  await readBuffer.mapAsync(GPUMapMode.READ);
+  const copy = readBuffer.getMappedRange().slice(0);
+  const elapsed = performance.now()-start;
+  readBuffer.unmap();
+  outputBuffer.destroy(); readBuffer.destroy(); uniformBuffer.destroy();
+  const packed = new Uint32Array(copy);
+  const bytes = new Uint8ClampedArray(byteSize);
+  for (let i=0,j=0;i<packed.length;i++,j+=4) {
+    const q=packed[i];
+    bytes[j]=q&255; bytes[j+1]=(q>>>8)&255; bytes[j+2]=(q>>>16)&255; bytes[j+3]=(q>>>24)&255;
+  }
+  return {pixels:bytes,time:elapsed};
+}
+function compare(a,b) {
+  let sum=0,max=0;
+  for(let i=0;i<a.length;i++){const d=Math.abs(a[i]-b[i]);sum+=d;if(d>max)max=d;}
+  $("meanDiff").textContent=(sum/a.length).toFixed(4);
+  $("maxDiff").textContent=String(max);
+}
+function updateSpeedup() {
+  const a=Number($("cpuTime").dataset.ms),b=Number($("gpuTime").dataset.ms);
+  if(a>0&&b>0)$("speedup").textContent=(a/b).toFixed(2)+"×";
+}
+async function runCPU(p) {
+  log("Начат расчёт CPU…");
+  const t0=performance.now(), pixels=mandelbrotCPU(p), elapsed=performance.now()-t0;
+  cpuPixels=pixels; drawPreview(cpuCtx,pixels,p);
+  $("cpuTime").textContent=elapsed.toFixed(2)+" ms"; $("cpuTime").dataset.ms=elapsed;
+  $("cpuInfo").textContent=`Готово: ${p.width} × ${p.height}`;
+  $("size").textContent=`${p.width} × ${p.height}`;
+  log(`CPU завершён: ${elapsed.toFixed(2)} ms`);
+}
+async function runGPU(p) {
+  log("Начат расчёт GPU…");
+  const result=await mandelbrotGPU(p);
+  gpuPixels=result.pixels; drawPreview(gpuCtx,gpuPixels,p);
+  $("gpuTime").textContent=result.time.toFixed(2)+" ms"; $("gpuTime").dataset.ms=result.time;
+  $("gpuInfo").textContent=`Готово: ${p.width} × ${p.height}`;
+  $("size").textContent=`${p.width} × ${p.height}`;
+  log(`GPU завершён: ${result.time.toFixed(2)} ms`);
+}
+async function run(which) {
+  setBusy(true); resetMetrics();
+  try {
+    const p=params();
+    $("size").textContent=`${p.width} × ${p.height}`;
+    if(which==="cpu"||which==="both") await runCPU(p);
+    if(which==="gpu"||which==="both") await runGPU(p);
+    updateSpeedup();
+    if(cpuPixels&&gpuPixels) {
+      compare(cpuPixels,gpuPixels);
+      log("Сравнение CPU/GPU завершено.");
+    }
+  } catch(e) {
+    log("ОШИБКА: "+e.message);
+    alert(e.message);
+  } finally { setBusy(false); }
+}
+$("cpuBtn").addEventListener("click",()=>run("cpu"));
+$("gpuBtn").addEventListener("click",()=>run("gpu"));
+$("bothBtn").addEventListener("click",()=>run("both"));
+$("resetBtn").addEventListener("click",()=>{
+  $("width").value=1920;$("height").value=1080;$("zoom").value="2.40";
+  $("offsetX").value="-0.10";$("offsetY").value="0.65";
+  $("maxIter").value=320;$("colorPower").value="0.50";
+  resetMetrics();$("size").textContent="1920 × 1080";
+  cpuCtx.clearRect(0,0,cpuCanvas.width,cpuCanvas.height);
+  gpuCtx.clearRect(0,0,gpuCanvas.width,gpuCanvas.height);
+  $("cpuInfo").textContent="Результат ещё не рассчитан.";
+  $("gpuInfo").textContent="Результат ещё не рассчитан.";
+  log("Параметры варианта 26 восстановлены.");
+});
+(async()=>{
+  try {
+    await initGPU();
+    $("support").textContent=`WebGPU доступен. Адаптер: ${adapter.info?.description || "определён браузером"}.`;
+    log("WebGPU успешно инициализирован.");
+  } catch(e) {
+    $("support").textContent="WebGPU: "+e.message;
+    log("Проверка WebGPU: "+e.message);
+  }
+})();
+</script>
+</body>
+</html>
