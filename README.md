@@ -90,6 +90,4 @@ The application implements the Mandelbrot iteration algorithm in two environment
 
 The application measures execution time and compares the resulting pixel data to evaluate performance and numerical differences.
 
-## License
 
-See the LICENSE file for details.
